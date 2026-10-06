@@ -55,6 +55,9 @@ def build_handler(service, static_dir):
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["api", "items"]:
                     return self._send(200, service.get_item(int(parts[2])))
+                if len(parts) == 5 and parts[:2] == ["api", "items"] and parts[3] == "audit" and parts[4] == "verify":
+                    ok, error = service.verify_audit(int(parts[2]))
+                    return self._send(200, {"item_id": int(parts[2]), "valid": ok, "error": error})
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "audit":
                     item = service.get_item(int(parts[2]))
                     return self._send(200, {"events": item["audit"]})
@@ -80,6 +83,11 @@ def build_handler(service, static_dir):
                     return self._send(201, service.create_item(payload, actor, role, region))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "sources":
                     return self._send(201, service.add_source(int(parts[2]), payload, actor, role, region))
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "merge":
+                    from_id = payload.get("from_item_id")
+                    if from_id is None:
+                        raise DomainError("from_item_id_required", "缺少 from_item_id", 400)
+                    return self._send(200, service.merge_events(int(from_id), int(parts[2]), actor, role, region))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "actions":
                     action = payload.pop("action", "")
                     if not action:

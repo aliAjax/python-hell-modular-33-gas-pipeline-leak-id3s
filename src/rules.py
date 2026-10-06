@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from .domain import DomainError
 
 ENTITY_TYPE = "pipeline_leak"
@@ -12,9 +14,13 @@ ACTION_ROLES = {
     "restore": {"supervisor"},
     "cancel": {"supervisor"},
 }
-ENFORCE_REGION = False
-REGION_SENSITIVE_ACTIONS = set()
+ENFORCE_REGION = True
+REGION_SENSITIVE_ACTIONS = {"verify", "isolate", "repair", "pressure_test", "restore", "cancel"}
 ACTION_REQUIRES_VERSION = {"isolate", "repair", "pressure_test", "restore", "cancel"}
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def assess(payload):
@@ -31,6 +37,25 @@ def assess(payload):
     else:
         level = "low"
     return {"score": round(score, 2), "level": level}
+
+
+def apply_correction(item):
+    """晚到记录改动管段或压降后的重算规则。
+
+    - 旧评分失效，按当前全部来源重算；
+    - 未执行的隔离方案（planned_valve_sequence）失效；
+    - 已关阀门保持关闭（valve_sequence / valve_states 不清空）；
+    - 事件退回待核验（reported）。
+    """
+    current = dict(item["payload"])
+    current["assessment"] = assess(current)
+    status = item["status"]
+    if status == "verified":
+        current.pop("planned_valve_sequence", None)
+        status = "reported"
+    elif status in ("isolated", "repaired", "tested"):
+        status = "reported"
+    return status, current
 
 
 def _need_status(item, allowed):
@@ -58,6 +83,9 @@ def apply_action(item, action, payload, actor, role):
             raise DomainError("field_confirmation_required", "需要现场确认", 409)
         current["assessment"] = assess(current)
         current["verification"] = {"confirmed": True, "note": payload.get("note", "")}
+        planned = payload.get("valve_sequence")
+        if isinstance(planned, list) and planned:
+            current["planned_valve_sequence"] = [value.strip() for value in planned if isinstance(value, str) and value.strip()]
         return "verified", current, {"assessment": current["assessment"], "verification": current["verification"]}
 
     if action == "isolate":
@@ -70,7 +98,11 @@ def apply_action(item, action, payload, actor, role):
         if not all(isinstance(value, str) and value.strip() for value in sequence):
             raise DomainError("invalid_valve_sequence", "阀门顺序格式无效")
         current["valve_sequence"] = [value.strip() for value in sequence]
-        return "isolated", current, {"valve_sequence": current["valve_sequence"]}
+        current["valve_states"] = {
+            value: {"state": "closed", "closed_at": _now_iso()} for value in current["valve_sequence"]
+        }
+        current.pop("planned_valve_sequence", None)
+        return "isolated", current, {"valve_sequence": current["valve_sequence"], "valve_states": current["valve_states"]}
 
     if action == "repair":
         _need_status(item, {"isolated", "repaired"})
@@ -97,6 +129,9 @@ def apply_action(item, action, payload, actor, role):
             raise DomainError("pressure_test_missing", "缺少通过的压力测试", 409)
         current["hazards_clear"] = True
         current["restoration"] = {"actor": actor, "note": payload.get("note", "")}
+        if isinstance(current.get("valve_states"), dict):
+            for value in current["valve_states"]:
+                current["valve_states"][value] = {"state": "open", "opened_at": _now_iso()}
         return "restored", current, {"restoration": current["restoration"]}
 
     if action == "cancel":

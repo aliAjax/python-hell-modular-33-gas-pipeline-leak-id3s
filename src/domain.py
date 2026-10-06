@@ -86,4 +86,6 @@ def normalize_source(payload):
         "odor_reports": int(payload.get("odor_reports", 0) or 0),
         "note": payload.get("note", ""),
     }
+    if payload.get("segment_id"):
+        result["segment_id"] = require_text(payload, "segment_id")
     return result

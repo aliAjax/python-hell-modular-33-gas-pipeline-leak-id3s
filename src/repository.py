@@ -2,12 +2,20 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+from . import rules
 from .audit import audit_hash, canonical_json
 from .domain import ConflictError, NotFoundError, DomainError
 
 
+MERGE_WINDOW_SECONDS = 30 * 60  # 同一管段半小时内的反馈合成事件
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 class Repository:
@@ -68,6 +76,14 @@ class Repository:
                     payload TEXT NOT NULL,
                     previous_hash TEXT NOT NULL,
                     event_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS operations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    item_id INTEGER,
+                    operation TEXT NOT NULL,
+                    result TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
                 """
@@ -139,6 +155,39 @@ class Repository:
         finally:
             conn.close()
 
+    def find_by_stable_key(self, entity_type, stable_key):
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM items WHERE entity_type=? AND stable_key=?",
+                (entity_type, stable_key),
+            ).fetchone()
+            return self._row_to_item(row)
+        finally:
+            conn.close()
+
+    def find_merge_candidate(self, pipeline_id, segment_id, reported_at, window_seconds=MERGE_WINDOW_SECONDS):
+        """同一管段、时间窗内的未终结事件作为合并候选。"""
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM items WHERE entity_type=? "
+                "AND json_extract(payload,'$.pipeline_id')=? "
+                "AND json_extract(payload,'$.segment_id')=? "
+                "AND status NOT IN ('cancelled','restored','merged') "
+                "ORDER BY id DESC",
+                (rules.ENTITY_TYPE, pipeline_id, segment_id),
+            ).fetchall()
+            target = parse_iso(reported_at)
+            for row in rows:
+                item = self._row_to_item(row)
+                item_time = parse_iso(item["payload"]["reported_at"])
+                if abs((target - item_time).total_seconds()) <= window_seconds:
+                    return item
+            return None
+        finally:
+            conn.close()
+
     def get_item(self, item_id):
         conn = self.connect()
         try:
@@ -161,12 +210,41 @@ class Repository:
             conn.close()
 
     def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role):
+        """写入来源记录；同一 (item, source_type, external_id) 幂等，重复送达不新增来源。
+
+        写盘失败后按来源编号重试：若记录已存在则直接返回，不重复写入。
+        若已存在但内容有变化（晚到更正），则更新原记录。
+        """
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             item = conn.execute("SELECT id FROM items WHERE id=?", (item_id,)).fetchone()
             if item is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
+            existing = conn.execute(
+                "SELECT * FROM sources WHERE item_id=? AND source_type=? AND external_id=?",
+                (item_id, source_type, external_id),
+            ).fetchone()
+            if existing:
+                source = dict(existing)
+                source["payload"] = json.loads(source["payload"])
+                if canonical_json(source["payload"]) != canonical_json(payload) or source["observed_at"] != observed_at:
+                    conn.execute(
+                        "UPDATE sources SET payload=?, observed_at=? WHERE id=?",
+                        (canonical_json(payload), observed_at, source["id"]),
+                    )
+                    source["payload"] = payload
+                    source["observed_at"] = observed_at
+                    self.append_audit(
+                        conn,
+                        item_id,
+                        "source_updated",
+                        actor,
+                        role,
+                        {"source_id": source["id"], "source_type": source_type, "external_id": external_id},
+                    )
+                conn.execute("COMMIT")
+                return source
             try:
                 conn.execute(
                     "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at) VALUES(?,?,?,?,?,?)",
@@ -184,7 +262,14 @@ class Repository:
                 {"source_id": source_id, "source_type": source_type, "external_id": external_id},
             )
             conn.execute("COMMIT")
-            return {"id": source_id, "item_id": item_id, "source_type": source_type, "external_id": external_id, "payload": payload, "observed_at": observed_at}
+            return {
+                "id": source_id,
+                "item_id": item_id,
+                "source_type": source_type,
+                "external_id": external_id,
+                "payload": payload,
+                "observed_at": observed_at,
+            }
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -237,6 +322,134 @@ class Repository:
         finally:
             conn.close()
 
+    def update_payload(self, item_id, new_payload, expected_version, event_type, actor, role, event_payload, new_status=None):
+        """来源合并或晚到更正后，以乐观锁更新事件载荷（可同时改状态）并追加审计。"""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            if expected_version is not None and int(expected_version) != int(row["version"]):
+                raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取")
+            version = int(row["version"]) + 1
+            if new_status is not None:
+                conn.execute(
+                    "UPDATE items SET status=?,payload=?,version=?,updated_at=? WHERE id=?",
+                    (new_status, canonical_json(new_payload), version, now_iso(), item_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE items SET payload=?,version=?,updated_at=? WHERE id=?",
+                    (canonical_json(new_payload), version, now_iso(), item_id),
+                )
+            self.append_audit(conn, item_id, event_type, actor, role, event_payload)
+            conn.execute("COMMIT")
+            return self.get_item(item_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def cancel_idempotent(self, item_id, actor, role, payload, expected_version=None):
+        """幂等撤销：同一事件只保留一份撤销记录。
+
+        两名值班员同时撤销时，先提交者完成撤销，后提交者读到已撤销状态直接返回，
+        不重复写入。以 operations 表记录幂等键，保证只留一份。
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            item = self._row_to_item(row)
+            key = "cancel:%s" % item_id
+            op = conn.execute("SELECT id FROM operations WHERE idempotency_key=?", (key,)).fetchone()
+            if op or item["status"] == "cancelled":
+                conn.execute("COMMIT")
+                return self.get_item(item_id), False
+            if expected_version is not None and int(expected_version) != int(row["version"]):
+                raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取")
+            new_status, new_payload, event_payload = rules.apply_action(item, "cancel", payload, actor, role)
+            version = int(row["version"]) + 1
+            conn.execute(
+                "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                (new_status, version, canonical_json(new_payload), now_iso(), item_id),
+            )
+            conn.execute(
+                "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                (item_id, "cancel", actor, role, canonical_json(event_payload), now_iso()),
+            )
+            self.append_audit(conn, item_id, "cancel", actor, role, event_payload)
+            conn.execute(
+                "INSERT INTO operations(idempotency_key,item_id,operation,result,created_at) VALUES(?,?,?,?,?)",
+                (key, item_id, "cancel", canonical_json({"status": new_status}), now_iso()),
+            )
+            conn.execute("COMMIT")
+            return self.get_item(item_id), True
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def record_merge_operation(self, from_item_id, to_item_id, actor, role):
+        """记录一次事件合并，幂等键保证同一次合并只留一份。"""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            key = "merge:%s:%s" % (to_item_id, from_item_id)
+            op = conn.execute("SELECT id FROM operations WHERE idempotency_key=?", (key,)).fetchone()
+            if op:
+                conn.execute("COMMIT")
+                return False
+            conn.execute(
+                "INSERT INTO operations(idempotency_key,item_id,operation,result,created_at) VALUES(?,?,?,?,?)",
+                (key, to_item_id, "merge", canonical_json({"from": from_item_id, "to": to_item_id}), now_iso()),
+            )
+            self.append_audit(conn, to_item_id, "merge", actor, role, {"from": from_item_id, "to": to_item_id})
+            conn.execute("COMMIT")
+            return True
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def move_sources(self, from_item_id, to_item_id):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("SELECT id FROM sources WHERE item_id=?", (from_item_id,)).fetchall()
+            moved = 0
+            for row in rows:
+                try:
+                    conn.execute("UPDATE sources SET item_id=? WHERE id=?", (to_item_id, row["id"]))
+                    moved += 1
+                except sqlite3.IntegrityError:
+                    conn.execute("DELETE FROM sources WHERE id=?", (row["id"],))
+            conn.execute("COMMIT")
+            return moved
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
     def audit_trail(self, item_id):
         conn = self.connect()
         try:
@@ -247,6 +460,29 @@ class Repository:
                 value["payload"] = json.loads(value["payload"])
                 result.append(value)
             return result
+        finally:
+            conn.close()
+
+    def verify_audit_chain(self, item_id):
+        """校验某事件的审计哈希链是否完整，用于重启后对账。"""
+        conn = self.connect()
+        try:
+            rows = conn.execute("SELECT * FROM audit_events WHERE item_id=? ORDER BY id", (item_id,)).fetchall()
+            previous = "GENESIS"
+            for row in rows:
+                event = {
+                    "item_id": row["item_id"],
+                    "event_type": row["event_type"],
+                    "actor": row["actor"],
+                    "role": row["role"],
+                    "payload": json.loads(row["payload"]),
+                    "created_at": row["created_at"],
+                }
+                expected = audit_hash(previous, event)
+                if expected != row["event_hash"]:
+                    return False, "hash mismatch at event %s" % row["id"]
+                previous = row["event_hash"]
+            return True, None
         finally:
             conn.close()
 
