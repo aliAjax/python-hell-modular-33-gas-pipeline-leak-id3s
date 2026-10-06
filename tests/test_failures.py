@@ -32,8 +32,11 @@ class FailureTest(unittest.TestCase):
 
     def test_duplicate_and_valve_conflict(self):
         item = self.service.create_item(self.payload, "d", "dispatcher")
-        with self.assertRaises(ConflictError):
-            self.service.create_item(self.payload, "d", "dispatcher")
+        again = self.service.create_item(self.payload, "d", "dispatcher")
+        self.assertEqual(again["id"], item["id"])
+        self.assertFalse(again["created_new"])
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(len(again["sources"]), 1)
         item["payload"]["valve_status_conflict"] = False
         item = self.service.act(item["id"], "verify", {"field_confirmed": True}, "r", "responder", item["version"])
         with self.assertRaises(DomainError) as context:

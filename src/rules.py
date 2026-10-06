@@ -2,6 +2,8 @@ from .domain import DomainError
 
 ENTITY_TYPE = "pipeline_leak"
 INITIAL_STATUS = "reported"
+TERMINAL_STATUSES = ("cancelled", "restored")
+MERGE_WINDOW_SECONDS = 1800
 CREATE_ROLES = {"dispatcher", "responder"}
 SOURCE_ROLES = {"dispatcher", "responder", "patrol", "sensor"}
 ACTION_ROLES = {
@@ -12,8 +14,8 @@ ACTION_ROLES = {
     "restore": {"supervisor"},
     "cancel": {"supervisor"},
 }
-ENFORCE_REGION = False
-REGION_SENSITIVE_ACTIONS = set()
+ENFORCE_REGION = True
+REGION_SENSITIVE_ACTIONS = {"verify", "isolate", "repair", "pressure_test", "restore", "cancel"}
 ACTION_REQUIRES_VERSION = {"isolate", "repair", "pressure_test", "restore", "cancel"}
 
 
@@ -31,6 +33,61 @@ def assess(payload):
     else:
         level = "low"
     return {"score": round(score, 2), "level": level}
+
+
+def apply_feedback(item, source):
+    """把一条来源记录并入事件账，返回 (新状态, 新载荷, 变更信息)。
+
+    晚到记录改动管段或压降时：旧评分与未执行隔离方案失效重算，
+    已关阀门保持关闭，事件退回待核验；终态事件只记账不改状态。
+    """
+    status = item["status"]
+    current = dict(item["payload"])
+    info = {"invalidated": False, "changes": {}, "metrics_updated": []}
+    if status in TERMINAL_STATUSES:
+        return status, current, info
+
+    changes = {}
+    new_segment = source.get("segment_id")
+    if new_segment and new_segment != current.get("segment_id"):
+        changes["segment_id"] = [current.get("segment_id"), new_segment]
+        current["segment_id"] = new_segment
+    new_pipeline = source.get("pipeline_id")
+    if new_pipeline and new_pipeline != current.get("pipeline_id"):
+        changes["pipeline_id"] = [current.get("pipeline_id"), new_pipeline]
+        current["pipeline_id"] = new_pipeline
+
+    pressure_changed = False
+    src_pressure = source.get("pressure_drop_kpa")
+    if src_pressure is not None and float(src_pressure) != float(current.get("pressure_drop_kpa", 0)):
+        pressure_changed = True
+        changes["pressure_drop_kpa"] = [current.get("pressure_drop_kpa", 0), float(src_pressure)]
+        current["pressure_drop_kpa"] = float(src_pressure)
+
+    metrics_touched = bool(changes)
+    for metric in ("sensor_value_ppm", "odor_reports"):
+        value = source.get(metric)
+        if value is None:
+            continue
+        if current.get(metric) != value:
+            current[metric] = value
+            metrics_touched = True
+            info["metrics_updated"].append(metric)
+
+    if metrics_touched:
+        current["assessment"] = assess(current)
+
+    segment_changed = "segment_id" in changes or "pipeline_id" in changes
+    if segment_changed or pressure_changed:
+        info["invalidated"] = True
+        info["changes"] = changes
+        info["closed_valves"] = list(current.get("closed_valves", []))
+        for key in ("verification", "repair", "pressure_test", "restoration"):
+            current.pop(key, None)
+        current["valve_sequence"] = []
+        current["hazards_clear"] = False
+        status = INITIAL_STATUS
+    return status, current, info
 
 
 def _need_status(item, allowed):
@@ -70,7 +127,10 @@ def apply_action(item, action, payload, actor, role):
         if not all(isinstance(value, str) and value.strip() for value in sequence):
             raise DomainError("invalid_valve_sequence", "阀门顺序格式无效")
         current["valve_sequence"] = [value.strip() for value in sequence]
-        return "isolated", current, {"valve_sequence": current["valve_sequence"]}
+        closed = set(current.get("closed_valves", []))
+        closed.update(current["valve_sequence"])
+        current["closed_valves"] = sorted(closed)
+        return "isolated", current, {"valve_sequence": current["valve_sequence"], "closed_valves": current["closed_valves"]}
 
     if action == "repair":
         _need_status(item, {"isolated", "repaired"})
